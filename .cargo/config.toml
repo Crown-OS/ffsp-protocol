@@ -1,0 +1,15 @@
+[alias]
+lint = "clippy --all-targets --all-features -- -D warnings"
+
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "target-feature=+neon",
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "link-arg=-Wl,--separate-loadable-segments",
+]
+
+[target.x86_64-linux-android]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "link-arg=-Wl,--separate-loadable-segments",
+]
