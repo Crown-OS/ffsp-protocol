@@ -28,6 +28,8 @@ struct InFlight {
     sent_at_millis: u64,
     deadline_millis: u64,
     len: u32,
+    /// What the lane had to send before this chunk, which a stall is charged for too.
+    queued_ahead_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -44,6 +46,8 @@ struct LaneState {
     stalls: u32,
     suspended: bool,
     parked: bool,
+    /// Whether any acknowledgement has measured this lane yet, rather than its profile's hint.
+    measured: bool,
 }
 
 impl LaneState {
@@ -59,6 +63,7 @@ impl LaneState {
             stalls: 0,
             suspended: false,
             parked: false,
+            measured: false,
         }
     }
 
@@ -75,9 +80,15 @@ impl LaneState {
     fn observe_service(&mut self, sent_at_millis: u64, now_millis: u64, len: u32) {
         let began = sent_at_millis.max(self.idle_since_millis);
         let elapsed_micros = now_millis.saturating_sub(began).saturating_mul(1_000);
-        self.estimator
-            .observe_delivery(u64::from(len), elapsed_micros);
+        if self.measured {
+            self.estimator
+                .observe_delivery(u64::from(len), elapsed_micros);
+        } else {
+            self.estimator
+                .observe_first_delivery(u64::from(len), elapsed_micros);
+        }
         self.idle_since_millis = now_millis;
+        self.measured = true;
     }
 
     /// How many chunks this lane may hold at once, from what it is measured to carry.
@@ -85,8 +96,13 @@ impl LaneState {
     /// A uniform depth lets the slowest lane queue as much work as the fastest, and since queued
     /// work is what the tail waits on, four chunks on a Bluetooth link is twenty seconds of
     /// nothing at the end of a transfer. One chunk per unit of capacity keeps every lane's queue
-    /// about the same length in time rather than in chunks.
+    /// about the same length in time rather than in chunks. A hint earns nothing: a lane holds one
+    /// chunk until an acknowledgement has measured it, since queueing on a wrong hint is what
+    /// stalls.
     const fn inflight_limit(&self, ceiling: u32) -> u32 {
+        if !self.measured {
+            return 1;
+        }
         let earned = self
             .estimator
             .bandwidth_kbps()
@@ -133,6 +149,9 @@ pub struct ChunkScheduler {
     bitmap: ChunkBitmap,
     lanes: BTreeMap<LaneId, LaneState>,
     inflight: BTreeMap<(ChunkIndex, LaneId), InFlight>,
+    /// Stalled chunks whose lane may still deliver them. Their late acknowledgement is the only
+    /// measurement that can restore an estimate the stall lowered.
+    overdue: BTreeMap<(ChunkIndex, LaneId), InFlight>,
     pending: VecDeque<ChunkIndex>,
     next_unsent: u32,
     delivered_bytes: u64,
@@ -145,14 +164,12 @@ impl ChunkScheduler {
     pub const DEFAULT_MAX_INFLIGHT_PER_LANE: u32 = 4;
     /// Capacity that earns a lane one more chunk in flight.
     const KBPS_PER_INFLIGHT_CHUNK: u32 = 64_000;
-    /// A chunk is considered stalled once it takes this many times its estimate.
+    /// A chunk is considered stalled once sending it takes this many times its estimate.
     const STALL_MULTIPLIER: u64 = 3;
-    /// Floor on the stall deadline, so an optimistic estimate cannot cause instant reassignment.
-    const MIN_STALL_MILLIS: u64 = 250;
-    /// Ceiling on it, so a lane that died silently is noticed in seconds rather than in however
-    /// long its queue was predicted to take. A Bluetooth lane holding four chunks would otherwise
-    /// go unquestioned for a minute.
-    const MAX_STALL_MILLIS: u64 = 3_000;
+    /// Floor on the stall deadline, so an unmeasured hint cannot reassign a healthy lane's work.
+    /// There is deliberately no ceiling: one megabyte on Bluetooth takes five seconds, and a cap
+    /// below that stalls every chunk the lane is given.
+    const MIN_STALL_MILLIS: u64 = 1_000;
 
     pub fn new(layout: ChunkLayout) -> Self {
         let bitmap = ChunkBitmap::new(layout.count());
@@ -167,6 +184,7 @@ impl ChunkScheduler {
             bitmap,
             lanes: BTreeMap::new(),
             inflight: BTreeMap::new(),
+            overdue: BTreeMap::new(),
             pending: VecDeque::new(),
             next_unsent: 0,
             delivered_bytes: delivered_bytes.min(layout.total_len()),
@@ -191,6 +209,7 @@ impl ChunkScheduler {
     /// would hold it as in flight until the stall timer expired, which on a slow lane is seconds
     /// of the tail spent waiting for something that was never sent.
     pub fn abandon(&mut self, index: ChunkIndex, lane: LaneId) -> bool {
+        self.overdue.remove(&(index, lane));
         let Some(flight) = self.inflight.remove(&(index, lane)) else {
             return false;
         };
@@ -209,14 +228,6 @@ impl ChunkScheduler {
     pub fn observe_rtt(&mut self, lane: LaneId, micros: u32) {
         if let Some(state) = self.lanes.get_mut(&lane) {
             state.estimator.observe_rtt(micros);
-        }
-    }
-
-    /// Records throughput the writer measured directly, at a resolution the scheduler's
-    /// millisecond clock cannot reach.
-    pub fn observe_throughput(&mut self, lane: LaneId, bytes: u64, elapsed_micros: u64) {
-        if let Some(state) = self.lanes.get_mut(&lane) {
-            state.estimator.observe_delivery(bytes, elapsed_micros);
         }
     }
 
@@ -241,6 +252,7 @@ impl ChunkScheduler {
     /// Drops a lane and returns its outstanding chunks to the queue.
     pub fn remove_lane(&mut self, lane: LaneId) -> usize {
         self.lanes.remove(&lane);
+        self.overdue.retain(|(_, owner), _| *owner != lane);
         self.reclaim(lane).len()
     }
 
@@ -298,12 +310,16 @@ impl ChunkScheduler {
         if loads.is_empty() {
             return None;
         }
+        let unsent = self.layout.count().saturating_sub(self.next_unsent);
+        let backlog_chunks = u32::try_from(self.pending.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(unsent);
 
         while let Some(index) = self.pending.pop_front() {
             if self.bitmap.contains(index) {
                 continue;
             }
-            let Some(assignment) = self.dispatch(index, &loads, now_millis, false) else {
+            let Some(assignment) = self.dispatch(index, &loads, now_millis, backlog_chunks) else {
                 self.pending.push_front(index);
                 return None;
             };
@@ -315,7 +331,7 @@ impl ChunkScheduler {
                 self.next_unsent += 1;
                 continue;
             }
-            let assignment = self.dispatch(index, &loads, now_millis, false)?;
+            let assignment = self.dispatch(index, &loads, now_millis, backlog_chunks)?;
             self.next_unsent += 1;
             return Some(assignment);
         }
@@ -329,6 +345,10 @@ impl ChunkScheduler {
         {
             state.queued_bytes = state.queued_bytes.saturating_sub(u64::from(flight.len));
             state.inflight_chunks = state.inflight_chunks.saturating_sub(1);
+            state.observe_service(flight.sent_at_millis, now_millis, flight.len);
+        } else if let Some(flight) = self.overdue.remove(&(index, lane))
+            && let Some(state) = self.lanes.get_mut(&lane)
+        {
             state.observe_service(flight.sent_at_millis, now_millis, flight.len);
         }
         let retired = self.retire_duplicates_of(index);
@@ -349,11 +369,13 @@ impl ChunkScheduler {
         }
     }
 
-    /// Returns chunks whose lane has gone quiet for long enough to hand them elsewhere.
+    /// Returns chunks whose lane has gone quiet for long enough to hand them elsewhere, with the
+    /// lane that was holding each.
     ///
-    /// The stalling lane's estimate is charged for the time it burned, which is what stops
-    /// earliest-completion from handing the same chunk straight back to it.
-    pub fn detect_stalls(&mut self, now_millis: u64) -> Vec<ChunkIndex> {
+    /// The stalling lane's estimate is capped at what it provably did not beat, which is what
+    /// stops earliest-completion from handing the same chunk straight back to it. The chunk stays
+    /// overdue on that lane, so a late acknowledgement still corrects the estimate.
+    pub fn detect_stalls(&mut self, now_millis: u64) -> Vec<(ChunkIndex, LaneId)> {
         let stalled: Vec<(ChunkIndex, LaneId)> = self
             .inflight
             .iter()
@@ -361,21 +383,25 @@ impl ChunkScheduler {
             .map(|(key, _)| *key)
             .collect();
 
-        let mut reassigned = Vec::with_capacity(stalled.len());
-        for (index, lane) in stalled {
-            if let Some(flight) = self.inflight.remove(&(index, lane))
-                && let Some(state) = self.lanes.get_mut(&lane)
-            {
-                state.queued_bytes = state.queued_bytes.saturating_sub(u64::from(flight.len));
-                state.inflight_chunks = state.inflight_chunks.saturating_sub(1);
-                state.stalls = state.stalls.saturating_add(1);
-                state.observe_service(flight.sent_at_millis, now_millis, flight.len);
+        for (index, lane) in &stalled {
+            if let Some(flight) = self.inflight.remove(&(*index, *lane)) {
+                if let Some(state) = self.lanes.get_mut(lane) {
+                    state.queued_bytes = state.queued_bytes.saturating_sub(u64::from(flight.len));
+                    state.inflight_chunks = state.inflight_chunks.saturating_sub(1);
+                    state.stalls = state.stalls.saturating_add(1);
+                    let elapsed_micros = now_millis
+                        .saturating_sub(flight.sent_at_millis)
+                        .saturating_mul(1_000);
+                    let owed = flight.queued_ahead_bytes + u64::from(flight.len);
+                    state.estimator.cap_delivery(owed, elapsed_micros);
+                }
+                self.overdue.insert((*index, *lane), flight);
             }
-            if !self.bitmap.contains(index) && self.requeue(index) {
-                reassigned.push(index);
+            if !self.bitmap.contains(*index) {
+                self.requeue(*index);
             }
         }
-        reassigned
+        stalled
     }
 
     pub const fn is_complete(&self) -> bool {
@@ -460,56 +486,122 @@ impl ChunkScheduler {
             .collect()
     }
 
+    /// The working lane with the most measured capacity, whether or not it has room right now.
+    fn fastest_working_lane(&self) -> Option<LaneLoad> {
+        self.lanes
+            .iter()
+            .filter(|(_, state)| state.is_working())
+            .max_by_key(|(lane, state)| {
+                (state.estimator.bandwidth_kbps(), std::cmp::Reverse(**lane))
+            })
+            .map(|(lane, state)| LaneLoad {
+                lane: *lane,
+                queued_bytes: state.queued_bytes,
+                estimator: state.estimator,
+            })
+    }
+
+    /// Earliest completion first, among the lanes that would not hold up the end of the transfer.
+    ///
+    /// A lane may take a chunk only if it would deliver it before the fastest lane could have
+    /// sent everything still unassigned, this chunk included. Otherwise waiting for the fastest
+    /// lane to free up is quicker, and handing the chunk out is what leaves a whole transfer
+    /// waiting on the last megabyte crossing Bluetooth.
     fn dispatch(
         &mut self,
         index: ChunkIndex,
         loads: &[LaneLoad],
         now_millis: u64,
-        duplicate: bool,
+        backlog_chunks: u32,
     ) -> Option<Assignment> {
         let len = self.layout.len_at(index)?;
+        let fastest = self.fastest_working_lane()?;
+        let backlog_bytes = u64::from(backlog_chunks.max(1)) * u64::from(CHUNK_LEN);
+        let fastest_finish = LaneLoad {
+            queued_bytes: fastest.queued_bytes.saturating_add(backlog_bytes),
+            ..fastest
+        }
+        .completion_micros(0);
         let eligible: Vec<LaneLoad> = loads
             .iter()
-            .filter(|load| !self.inflight.contains_key(&(index, load.lane)))
+            .filter(|load| {
+                load.lane == fastest.lane || load.completion_micros(len) <= fastest_finish
+            })
             .copied()
             .collect();
         let lane = earliest_completion(&eligible, len)?;
+        Some(self.assign(index, lane, len, now_millis, false))
+    }
 
-        let state = self.lanes.get_mut(&lane)?;
-        state.queued_bytes = state.queued_bytes.saturating_add(u64::from(len));
-        state.inflight_chunks += 1;
-        let estimate_millis = state.estimator.drain_micros(state.queued_bytes) / 1_000;
-        let deadline = now_millis
-            + (estimate_millis * Self::STALL_MULTIPLIER)
-                .clamp(Self::MIN_STALL_MILLIS, Self::MAX_STALL_MILLIS);
-
+    fn assign(
+        &mut self,
+        index: ChunkIndex,
+        lane: LaneId,
+        len: u32,
+        now_millis: u64,
+        duplicate: bool,
+    ) -> Assignment {
+        let mut queued_ahead_bytes = 0;
+        let mut deadline_millis = now_millis;
+        if let Some(state) = self.lanes.get_mut(&lane) {
+            queued_ahead_bytes = state.queued_bytes;
+            state.queued_bytes = state.queued_bytes.saturating_add(u64::from(len));
+            state.inflight_chunks += 1;
+            let ahead_millis = state.estimator.drain_micros(queued_ahead_bytes) / 1_000;
+            let sending_millis = state.estimator.drain_micros(u64::from(len)) / 1_000;
+            deadline_millis += ahead_millis
+                + (sending_millis * Self::STALL_MULTIPLIER).max(Self::MIN_STALL_MILLIS);
+        }
         self.inflight.insert(
             (index, lane),
             InFlight {
                 sent_at_millis: now_millis,
-                deadline_millis: deadline,
+                deadline_millis,
                 len,
+                queued_ahead_bytes,
             },
         );
-        Some(Assignment {
+        Assignment {
             index,
             lane,
             len,
             duplicate,
-        })
+        }
     }
 
-    /// Sends the oldest outstanding chunk a second time once the tail is all that remains.
+    /// Sends an outstanding chunk a second time once the tail is all that remains, to a lane that
+    /// would deliver it before the lane already holding it.
     fn duplicate_tail(&mut self, loads: &[LaneLoad], now_millis: u64) -> Option<Assignment> {
         let lane_count = u32::try_from(self.working_lane_count()).unwrap_or(u32::MAX);
         if self.bitmap.remaining() > lane_count.saturating_mul(2) {
             return None;
         }
-        let oldest = self
+        let mut outstanding: Vec<(u64, ChunkIndex, LaneId)> = self
             .inflight
             .iter()
-            .min_by_key(|(key, flight)| (flight.sent_at_millis, key.0))
-            .map(|(key, _)| key.0)?;
-        self.dispatch(oldest, loads, now_millis, true)
+            .map(|((index, lane), flight)| (flight.sent_at_millis, *index, *lane))
+            .collect();
+        outstanding.sort_unstable();
+        outstanding.into_iter().find_map(|(_, index, holder)| {
+            let len = self.layout.len_at(index)?;
+            let holder_finish = self.lanes.get(&holder).map(|state| {
+                LaneLoad {
+                    lane: holder,
+                    queued_bytes: state.queued_bytes,
+                    estimator: state.estimator,
+                }
+                .completion_micros(0)
+            })?;
+            let eligible: Vec<LaneLoad> = loads
+                .iter()
+                .filter(|load| {
+                    !self.inflight.contains_key(&(index, load.lane))
+                        && load.completion_micros(len) < holder_finish
+                })
+                .copied()
+                .collect();
+            let lane = earliest_completion(&eligible, len)?;
+            Some(self.assign(index, lane, len, now_millis, true))
+        })
     }
 }

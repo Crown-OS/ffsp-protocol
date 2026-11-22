@@ -30,6 +30,26 @@ impl LaneEstimator {
         self.bandwidth_kbps = smooth(u64::from(self.bandwidth_kbps), sample).max(1);
     }
 
+    /// Replaces the profile's hint with the first real measurement, which outweighs it entirely.
+    pub fn observe_first_delivery(&mut self, bytes: u64, elapsed_micros: u64) {
+        if elapsed_micros == 0 {
+            return;
+        }
+        let sample = bytes.saturating_mul(8_000) / elapsed_micros;
+        self.bandwidth_kbps = u32::try_from(sample).unwrap_or(u32::MAX).max(1);
+    }
+
+    /// Lowers the estimate to what the lane provably did not beat: `bytes` were still undelivered
+    /// after `elapsed_micros`.
+    pub fn cap_delivery(&mut self, bytes: u64, elapsed_micros: u64) {
+        if elapsed_micros == 0 {
+            return;
+        }
+        let ceiling =
+            u32::try_from(bytes.saturating_mul(8_000) / elapsed_micros).unwrap_or(u32::MAX);
+        self.bandwidth_kbps = self.bandwidth_kbps.min(ceiling).max(1);
+    }
+
     pub fn observe_rtt(&mut self, micros: u32) {
         self.rtt_micros = smooth(u64::from(self.rtt_micros), u64::from(micros));
     }

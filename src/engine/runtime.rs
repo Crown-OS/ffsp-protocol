@@ -8,8 +8,7 @@ use blake3::hazmat::ChainingValue;
 use tokio::sync::mpsc;
 
 use crate::control::{
-    ChunkAck, ChunkMapPage, ControlMessage, Delivery, EndReason, KeepAlive, LaneInvite, LaneReport,
-    TransferId,
+    ChunkAck, ChunkMapPage, ControlMessage, Delivery, EndReason, KeepAlive, LaneInvite, TransferId,
 };
 use crate::crypto::has_aes_hardware;
 use crate::device::DeviceId;
@@ -351,7 +350,6 @@ impl Runtime {
             write,
             keys.outbound,
             Arc::clone(&self.pool),
-            Arc::clone(&self.config.clock),
             self.notices.0.clone(),
         );
         tokio::spawn(writer.run(bulk_rx, priority_rx));
@@ -647,7 +645,7 @@ impl Runtime {
                 Ok(())
             }
             InboundKind::Ack(ack) => self.on_ack(device, &ack),
-            InboundKind::Report(report) => self.on_report(device, lane, report),
+            InboundKind::Report => Ok(()),
             InboundKind::KeepAlive {
                 keepalive,
                 at_micros,
@@ -935,23 +933,6 @@ impl Runtime {
         Ok(())
     }
 
-    fn on_report(
-        &mut self,
-        device: DeviceId,
-        lane: LaneId,
-        report: LaneReport,
-    ) -> Result<(), EngineError> {
-        let Some(peer) = self.peers.get_mut(&device) else {
-            return Ok(());
-        };
-        if let Some(outbound) = peer.outbound.as_mut() {
-            outbound
-                .scheduler
-                .observe_throughput(lane, report.delivered_bytes, 1);
-        }
-        Ok(())
-    }
-
     fn on_keepalive(
         &mut self,
         device: DeviceId,
@@ -1027,24 +1008,18 @@ impl Runtime {
                 device,
                 lane,
                 frame_bytes,
-                elapsed_micros,
                 chunk,
             } => {
-                if let Some(peer) = self.peers.get_mut(&device) {
-                    if let Some(handle) = peer.lanes.get_mut(&lane) {
-                        handle.meter.record_sent_frame(frame_bytes);
-                        if chunk.is_some() {
-                            handle.meter.record_sent_chunk();
-                        }
-                    }
-                    if chunk.is_some()
-                        && let Some(outbound) = peer.outbound.as_mut()
-                    {
-                        // Measured at the wire, at a resolution the scheduler's millisecond
-                        // clock cannot reach.
-                        outbound
-                            .scheduler
-                            .observe_throughput(lane, frame_bytes, elapsed_micros);
+                // How long a write took says how fast the kernel took the bytes, not how fast the
+                // peer got them, so only acknowledgements teach the scheduler.
+                if let Some(handle) = self
+                    .peers
+                    .get_mut(&device)
+                    .and_then(|peer| peer.lanes.get_mut(&lane))
+                {
+                    handle.meter.record_sent_frame(frame_bytes);
+                    if chunk.is_some() {
+                        handle.meter.record_sent_chunk();
                     }
                 }
             }
@@ -1119,8 +1094,10 @@ impl Runtime {
             if !outbound.ready {
                 continue;
             }
-            for index in outbound.scheduler.detect_stalls(now_millis) {
-                for handle in peer.lanes.values() {
+            // Only the lane that stalled is told: any other lane may be about to carry the
+            // chunk's replacement.
+            for (index, lane) in outbound.scheduler.detect_stalls(now_millis) {
+                if let Some(handle) = peer.lanes.get(&lane) {
                     handle.send_priority(Outbound::Abandon(index));
                 }
             }

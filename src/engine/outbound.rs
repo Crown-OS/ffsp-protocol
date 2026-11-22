@@ -7,7 +7,6 @@ use crate::crypto::LaneCipher;
 use crate::device::DeviceId;
 use crate::io::{ChunkBuffer, ChunkBufferPool};
 use crate::medium::LaneWriteEnd;
-use crate::platform::Clock;
 use crate::wire::{ChunkIndex, FrameKind, LaneId};
 
 /// Work handed to a lane's writer.
@@ -34,7 +33,6 @@ pub(crate) enum LaneNotice {
         device: DeviceId,
         lane: LaneId,
         frame_bytes: u64,
-        elapsed_micros: u64,
         chunk: Option<ChunkIndex>,
     },
     /// A chunk was dropped before it went out, so its buffer is free and the scheduler's
@@ -63,18 +61,16 @@ pub(crate) struct LaneWriter {
     write: LaneWriteEnd,
     cipher: LaneCipher,
     pool: Arc<ChunkBufferPool>,
-    clock: Arc<dyn Clock>,
     notices: mpsc::UnboundedSender<LaneNotice>,
     abandoned: BTreeSet<ChunkIndex>,
 }
 
 impl LaneWriter {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         device: DeviceId,
         write: LaneWriteEnd,
         cipher: LaneCipher,
         pool: Arc<ChunkBufferPool>,
-        clock: Arc<dyn Clock>,
         notices: mpsc::UnboundedSender<LaneNotice>,
     ) -> Self {
         Self {
@@ -83,7 +79,6 @@ impl LaneWriter {
             write,
             cipher,
             pool,
-            clock,
             notices,
             abandoned: BTreeSet::new(),
         }
@@ -147,18 +142,15 @@ impl LaneWriter {
             Ok(header) => header,
             Err(error) => return self.fail(error.to_string()),
         };
-        let began = self.clock.now_micros();
         if let Err(error) = self.write.send_frame(&header, body.as_ref()).await {
             return self.fail(error.to_string());
         }
-        let elapsed_micros = self.clock.now_micros().saturating_sub(began);
         let frame_bytes = (crate::wire::FrameHeader::LEN + body.as_ref().len()) as u64;
         self.notices
             .send(LaneNotice::Wrote {
                 device: self.device,
                 lane: self.lane,
                 frame_bytes,
-                elapsed_micros,
                 chunk,
             })
             .is_ok()

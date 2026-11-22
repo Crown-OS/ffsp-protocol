@@ -435,20 +435,42 @@ struct Simulation {
     scheduler: ChunkScheduler,
     lanes: std::collections::BTreeMap<LaneId, SimulatedLane>,
     now_millis: u64,
+    detects_stalls: bool,
+}
+
+/// A lane as it really is, next to what its profile claims before anything is measured.
+#[derive(Debug, Clone, Copy)]
+struct HintedLane {
+    kbps: u32,
+    hint_kbps: u32,
+    rtt_micros: u32,
 }
 
 impl Simulation {
     fn new(total_len: u64, specs: &[(u32, u32)]) -> Self {
+        let lanes: Vec<HintedLane> = specs
+            .iter()
+            .map(|(kbps, rtt_micros)| HintedLane {
+                kbps: *kbps,
+                hint_kbps: *kbps,
+                rtt_micros: *rtt_micros,
+            })
+            .collect();
+        Self::hinted(total_len, &lanes, false)
+    }
+
+    /// Lanes whose hints are wrong, with the stall timer running as the engine runs it.
+    fn hinted(total_len: u64, specs: &[HintedLane], detects_stalls: bool) -> Self {
         let layout = ChunkLayout::new(total_len).unwrap();
         let mut scheduler = ChunkScheduler::new(layout);
         let mut lanes = std::collections::BTreeMap::new();
-        for (index, (kbps, rtt)) in specs.iter().enumerate() {
+        for (index, spec) in specs.iter().enumerate() {
             let lane = LaneId::new(u16::try_from(index + 1).unwrap());
-            scheduler.add_lane(lane, &profile_with(*kbps, *rtt));
+            scheduler.add_lane(lane, &profile_with(spec.hint_kbps, spec.rtt_micros));
             lanes.insert(
                 lane,
                 SimulatedLane {
-                    kbps: *kbps,
+                    kbps: spec.kbps,
                     free_at_millis: 0,
                     inflight: Vec::new(),
                     delivered: 0,
@@ -459,6 +481,7 @@ impl Simulation {
             scheduler,
             lanes,
             now_millis: 0,
+            detects_stalls,
         }
     }
 
@@ -520,6 +543,10 @@ impl Simulation {
         for _ in 0..100_000 {
             if self.scheduler.is_complete() {
                 return self.now_millis;
+            }
+            if self.detects_stalls {
+                // A stalled chunk already on the wire stays there, so its lane still delivers it.
+                self.scheduler.detect_stalls(self.now_millis);
             }
             self.dispatch_all();
             if !self.advance() {
@@ -635,6 +662,7 @@ fn a_lane_lost_mid_transfer_hands_its_chunks_back() {
     let mut simulation = Simulation::new(PAYLOAD, &[(100_000, 4_000), (100_000, 4_000)]);
     simulation.dispatch_all();
     simulation.advance();
+    simulation.dispatch_all();
 
     let doomed = simulation.lane(1);
     let orphaned = simulation.scheduler.remove_lane(doomed);
@@ -662,7 +690,10 @@ fn a_stalled_chunk_moves_to_a_different_lane() {
         "reassigned before the deadline"
     );
 
-    assert_eq!(scheduler.detect_stalls(60_000), vec![sent.index]);
+    assert_eq!(
+        scheduler.detect_stalls(60_000),
+        vec![(sent.index, sent.lane)]
+    );
     let retry = scheduler.next_assignment(60_000).unwrap();
     assert_eq!(retry.index, sent.index);
     assert_ne!(
@@ -687,25 +718,34 @@ fn a_chunk_that_arrives_twice_is_counted_once() {
 
 #[test]
 fn a_chunk_delivered_by_one_lane_retires_the_copy_on_another() {
-    let layout = ChunkLayout::new(2 * MIB as u64).unwrap();
+    let layout = ChunkLayout::new(3 * MIB as u64).unwrap();
     let mut scheduler = ChunkScheduler::new(layout);
-    let first = LaneId::new(1);
-    let second = LaneId::new(2);
-    scheduler.add_lane(first, &profile_with(100_000, 4_000));
-    scheduler.add_lane(second, &profile_with(100_000, 4_000));
+    scheduler.add_lane(LaneId::new(1), &profile_with(100_000, 4_000));
+    scheduler.add_lane(LaneId::new(2), &profile_with(100_000, 4_000));
 
     let a = scheduler.next_assignment(0).unwrap();
     let b = scheduler.next_assignment(0).unwrap();
     assert_ne!(a.lane, b.lane);
 
-    // With both chunks out, the tail rule starts duplicating rather than idling.
-    let duplicate = scheduler.next_assignment(0).unwrap();
-    assert!(duplicate.duplicate);
-    assert_ne!(duplicate.lane, a.lane);
+    // The second lane proves far faster than the first is expected to be.
+    scheduler.on_delivered(b.index, b.lane, 10);
+    let c = scheduler.next_assignment(10).unwrap();
+    assert_eq!(c.lane, b.lane);
 
-    scheduler.on_delivered(a.index, a.lane, 100);
-    scheduler.on_delivered(b.index, b.lane, 100);
+    // With nothing fresh left, the tail rule copies the slow lane's chunk rather than idling.
+    let duplicate = scheduler.next_assignment(10).unwrap();
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.index, a.index);
+    assert_eq!(duplicate.lane, b.lane);
+
+    scheduler.on_delivered(c.index, c.lane, 20);
+    scheduler.on_delivered(a.index, duplicate.lane, 30);
     assert!(scheduler.is_complete());
+    let retired: u32 = scheduler
+        .lane_stats()
+        .map(|lane| lane.inflight_chunks)
+        .sum();
+    assert_eq!(retired, 0, "the slow lane still holds a copy");
 }
 
 #[test]
@@ -736,12 +776,25 @@ fn the_tail_is_never_duplicated_while_fresh_work_remains() {
 /// seconds of work sitting behind the one lane the tail will wait on.
 #[test]
 fn a_slow_lane_queues_less_work_than_a_fast_one() {
-    let layout = ChunkLayout::new(PAYLOAD).unwrap();
+    // Large enough that Bluetooth can finish a chunk before Wi-Fi could finish everything.
+    let layout = ChunkLayout::new(1024 * MIB as u64).unwrap();
     let mut scheduler = ChunkScheduler::new(layout);
     let wifi = LaneId::new(1);
     let bluetooth = LaneId::new(2);
     scheduler.add_lane(wifi, &LaneProfile::WIFI_INFRA);
     scheduler.add_lane(bluetooth, &LaneProfile::BLUETOOTH_CLASSIC);
+    let first = scheduler.next_assignment(0).unwrap();
+    let second = scheduler.next_assignment(0).unwrap();
+    for sent in [first, second] {
+        let profile = if sent.lane == wifi {
+            LaneProfile::WIFI_INFRA
+        } else {
+            LaneProfile::BLUETOOTH_CLASSIC
+        };
+        let took = transmit_millis(sent.len, profile.bandwidth_hint_kbps);
+        scheduler.on_delivered(sent.index, sent.lane, took);
+    }
+    assert_ne!(first.lane, second.lane, "one lane went unmeasured");
 
     let limits: std::collections::BTreeMap<LaneId, u32> = scheduler
         .lane_stats()
@@ -851,6 +904,49 @@ fn two_equal_lanes_are_credited_with_a_real_share_each() {
     for share in shares {
         assert!(share * 10 > total, "a lane at {share}/{total} is failover");
     }
+}
+
+/// The rig's three mediums as measured, against the hints they start from: striping has to beat
+/// the cable alone even while every estimate is still wrong.
+#[test]
+fn striping_over_misjudged_lanes_beats_the_fastest_lane_alone() {
+    const PAYLOAD_LEN: u64 = 128 * MIB as u64;
+    let usb = HintedLane {
+        kbps: 155_000,
+        hint_kbps: 280_000,
+        rtt_micros: 500,
+    };
+    let wifi = HintedLane {
+        kbps: 19_000,
+        hint_kbps: 400_000,
+        rtt_micros: 4_000,
+    };
+    let bluetooth = HintedLane {
+        kbps: 1_500,
+        hint_kbps: 1_600,
+        rtt_micros: 30_000,
+    };
+
+    let alone = Simulation::hinted(PAYLOAD_LEN, &[usb], true).run();
+    let mut striped = Simulation::hinted(PAYLOAD_LEN, &[usb, wifi, bluetooth], true);
+    let together = striped.run();
+
+    let stalls: u32 = striped.scheduler.lane_stats().map(|lane| lane.stalls).sum();
+    let wifi_chunks = striped.delivered_by(striped.lane(1));
+    assert!(
+        together * 100 <= alone * 95,
+        "striping took {together}ms against {alone}ms on USB alone \
+         (wifi carried {wifi_chunks}, {stalls} stalls)"
+    );
+    let per_lane: Vec<(u32, u32)> = striped
+        .scheduler
+        .lane_stats()
+        .map(|lane| (lane.delivered_chunks, lane.stalls))
+        .collect();
+    assert!(
+        stalls <= 2,
+        "{stalls} stalls on lanes that never failed: {per_lane:?}, {together}ms vs {alone}ms"
+    );
 }
 
 #[test]

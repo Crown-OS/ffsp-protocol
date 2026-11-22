@@ -49,7 +49,7 @@ pub(crate) enum InboundKind {
     /// A control body the engine does not interpret, for the platform to deal with.
     Platform(Vec<u8>),
     Ack(ChunkAck),
-    Report(LaneReport),
+    Report,
     KeepAlive {
         keepalive: KeepAlive,
         at_micros: u64,
@@ -153,7 +153,8 @@ impl LaneReader {
                 InboundKind::Ack(ChunkAck::parse(body).map_err(|error| error.to_string())?)
             }
             FrameKind::LaneReport => {
-                InboundKind::Report(LaneReport::parse(body).map_err(|error| error.to_string())?)
+                LaneReport::parse(body).map_err(|error| error.to_string())?;
+                InboundKind::Report
             }
             FrameKind::KeepAlive => InboundKind::KeepAlive {
                 keepalive: KeepAlive::parse(body).map_err(|error| error.to_string())?,
